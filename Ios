@@ -1,37 +1,61 @@
 import Security
+import Foundation
 
-func decryptRSAWithDiagnostics(base64Ciphertext: String, privateKey: SecKey) -> Data? {
-    guard let cipherData = Data(base64Encoded: base64Ciphertext) else { return nil }
+/// Decrypts Base64-encoded RSA-OAEP-SHA256 ciphertext using the given private key.
+/// Returns the decrypted plaintext as a UTF-8 String, or nil on failure.
+func decryptRSAWithDiagnostics(base64Ciphertext: String, privateKey: SecKey) -> String? {
     
-    // 1. Try standard OAEP SHA256 (matches server with MGF1=SHA256)
+    // 1. Decode Base64 ciphertext from server
+    guard let cipherData = Data(base64Encoded: base64Ciphertext) else {
+        print("❌ Failed: Invalid Base64 ciphertext")
+        return nil
+    }
+    
+    // 2. Attempt standard OAEP SHA-256 decryption (matches server MGF1=SHA256)
     var error: Unmanaged<CFError>?
-    if let decrypted = SecKeyCreateDecryptedData(
+    guard let decryptedData = SecKeyCreateDecryptedData(
         privateKey,
         .rsaEncryptionOAEPSHA256,
         cipherData as CFData,
         &error
-    ) as Data? {
-        return decrypted
+    ) as Data? else {
+        
+        // --- Diagnostic block ---
+        if let cfError = error?.takeRetainedValue() {
+            let nsError = cfError as NSError
+            print("❌ Decryption failed")
+            print("   Domain: \(nsError.domain)")
+            print("   Code: \(nsError.code)")
+            print("   Description: \(nsError.localizedDescription)")
+            
+            // Common OSStatus codes for RSA decryption
+            switch nsError.code {
+            case -50:  // errSecParam
+                print("   → errSecParam: One or more parameters passed are not valid.")
+                print("   → Likely cause: MGF1 hash mismatch (server using SHA-1).")
+            case -26275: // errSecDecode (older iOS)
+                print("   → errSecDecode: Unable to decode the provided data.")
+                print("   → Likely cause: Padding mismatch or wrong key.")
+            case -26276: // errSecInternal
+                print("   → errSecInternal: Internal error in Security framework.")
+            default:
+                print("   → Check server MGF1 = SHA256, and ciphertext integrity.")
+            }
+        } else {
+            print("❌ Decryption failed with unknown error")
+        }
+        // --- End diagnostic block ---
+        
+        return nil
     }
     
-    // 2. If that fails, the server likely used MGF1=SHA1.
-    // iOS does not natively support mixed OAEP (SHA256 main + SHA1 MGF1).
-    // You MUST use a hybrid approach or fix the server.
-    let errorCode = (error?.takeRetainedValue() as? NSError)?.code ?? 0
-    print("Standard OAEP-SHA256 failed with code: \(errorCode)")
-    
-    // Diagnostic: Check if the raw RSA operation works (strips padding)
-    // This confirms the key/math is correct but padding is wrong.
-    if let rawDecrypted = SecKeyCreateDecryptedData(
-        privateKey,
-        .rsaEncryptionRaw, // Note: This may not be supported in Keychain
-        cipherData as CFData,
-        &error
-    ) as Data? {
-        // If raw succeeds, the padding is the issue.
-        // You would need to manually implement OAEP unpadding here (complex).
-        print("Raw RSA works - padding mismatch confirmed.")
+    // 3. Convert decrypted bytes to UTF-8 String
+    guard let plaintext = String(data: decryptedData, encoding: .utf8) else {
+        print("❌ Decryption succeeded, but UTF-8 decoding failed")
+        print("   Raw bytes: \(decryptedData.map { String(format: "%02x", $0) }.joined())")
+        return nil
     }
     
-    return nil
+    print("✅ Decryption successful: \(plaintext)")
+    return plaintext
 }
