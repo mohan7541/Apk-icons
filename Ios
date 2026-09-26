@@ -1,0 +1,37 @@
+import Security
+
+func decryptRSAWithDiagnostics(base64Ciphertext: String, privateKey: SecKey) -> Data? {
+    guard let cipherData = Data(base64Encoded: base64Ciphertext) else { return nil }
+    
+    // 1. Try standard OAEP SHA256 (matches server with MGF1=SHA256)
+    var error: Unmanaged<CFError>?
+    if let decrypted = SecKeyCreateDecryptedData(
+        privateKey,
+        .rsaEncryptionOAEPSHA256,
+        cipherData as CFData,
+        &error
+    ) as Data? {
+        return decrypted
+    }
+    
+    // 2. If that fails, the server likely used MGF1=SHA1.
+    // iOS does not natively support mixed OAEP (SHA256 main + SHA1 MGF1).
+    // You MUST use a hybrid approach or fix the server.
+    let errorCode = (error?.takeRetainedValue() as? NSError)?.code ?? 0
+    print("Standard OAEP-SHA256 failed with code: \(errorCode)")
+    
+    // Diagnostic: Check if the raw RSA operation works (strips padding)
+    // This confirms the key/math is correct but padding is wrong.
+    if let rawDecrypted = SecKeyCreateDecryptedData(
+        privateKey,
+        .rsaEncryptionRaw, // Note: This may not be supported in Keychain
+        cipherData as CFData,
+        &error
+    ) as Data? {
+        // If raw succeeds, the padding is the issue.
+        // You would need to manually implement OAEP unpadding here (complex).
+        print("Raw RSA works - padding mismatch confirmed.")
+    }
+    
+    return nil
+}
