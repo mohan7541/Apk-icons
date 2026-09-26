@@ -1,61 +1,167 @@
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import javax.crypto.Cipher;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.MGF1ParameterSpec;
+import javax.crypto.spec.PSource;
+import java.security.*;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
+
+public class RSAEncryptor {
+
+    // CRITICAL: Force BouncyCastle provider
+    private static final String PROVIDER = "BC";
+    private static final String TRANSFORMATION = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
+
+    static {
+        if (Security.getProvider(PROVIDER) == null) {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+    }
+
+    public static String encryptData(String publicKeyBase64, String plaintext) throws Exception {
+        // Decode X.509/SPKI public key from iOS
+        byte[] keyBytes = Base64.getDecoder().decode(publicKeyBase64);
+        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(keyBytes);
+        
+        // Force BouncyCastle KeyFactory
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA", PROVIDER);
+        PublicKey publicKey = keyFactory.generatePublic(keySpec);
+
+        // Force BouncyCastle Cipher
+        Cipher cipher = Cipher.getInstance(TRANSFORMATION, PROVIDER);
+
+        // Explicitly set MGF1 to SHA-256 (BouncyCastle honors this; SunJCE does not)
+        OAEPParameterSpec oaepSpec = new OAEPParameterSpec(
+            "SHA-256",
+            "MGF1",
+            MGF1ParameterSpec.SHA256,
+            PSource.PSpecified.DEFAULT
+        );
+
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey, oaepSpec);
+        byte[] encrypted = cipher.doFinal(plaintext.getBytes("UTF-8"));
+        return Base64.getEncoder().encodeToString(encrypted);
+    }
+}
+
 import Security
 import Foundation
 
-/// Decrypts Base64-encoded RSA-OAEP-SHA256 ciphertext using the given private key.
-/// Returns the decrypted plaintext as a UTF-8 String, or nil on failure.
-func decryptRSAWithDiagnostics(base64Ciphertext: String, privateKey: SecKey) -> String? {
+class RSAKeyManager {
     
-    // 1. Decode Base64 ciphertext from server
-    guard let cipherData = Data(base64Encoded: base64Ciphertext) else {
-        print("❌ Failed: Invalid Base64 ciphertext")
-        return nil
-    }
+    static let privateKeyTag = "com.yourapp.rsa.private".data(using: .utf8)!
     
-    // 2. Attempt standard OAEP SHA-256 decryption (matches server MGF1=SHA256)
-    var error: Unmanaged<CFError>?
-    guard let decryptedData = SecKeyCreateDecryptedData(
-        privateKey,
-        .rsaEncryptionOAEPSHA256,
-        cipherData as CFData,
-        &error
-    ) as Data? else {
+    // MARK: - Key Generation (iOS 10+)
+    
+    /// Generates a 2048-bit RSA keypair, stores private key in Keychain, returns public key in X.509/SPKI Base64.
+    static func generateKeyPair() -> String? {
+        // Remove any existing key to prevent stale-key mismatches
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: privateKeyTag,
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
         
-        // --- Diagnostic block ---
-        if let cfError = error?.takeRetainedValue() {
-            let nsError = cfError as NSError
-            print("❌ Decryption failed")
-            print("   Domain: \(nsError.domain)")
-            print("   Code: \(nsError.code)")
-            print("   Description: \(nsError.localizedDescription)")
-            
-            // Common OSStatus codes for RSA decryption
-            switch nsError.code {
-            case -50:  // errSecParam
-                print("   → errSecParam: One or more parameters passed are not valid.")
-                print("   → Likely cause: MGF1 hash mismatch (server using SHA-1).")
-            case -26275: // errSecDecode (older iOS)
-                print("   → errSecDecode: Unable to decode the provided data.")
-                print("   → Likely cause: Padding mismatch or wrong key.")
-            case -26276: // errSecInternal
-                print("   → errSecInternal: Internal error in Security framework.")
-            default:
-                print("   → Check server MGF1 = SHA256, and ciphertext integrity.")
-            }
-        } else {
-            print("❌ Decryption failed with unknown error")
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeySizeInBits as String: 2048,
+            kSecPrivateKeyAttrs as String: [
+                kSecAttrIsPermanent as String: true,
+                kSecAttrApplicationTag as String: privateKeyTag,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
+        ]
+        
+        var error: Unmanaged<CFError>?
+        guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
+            print("Key generation failed: \(error!.takeRetainedValue())")
+            return nil
         }
-        // --- End diagnostic block ---
         
-        return nil
+        guard let publicKey = SecKeyCopyPublicKey(privateKey) else { return nil }
+        return exportPublicKeyAsX509(publicKey)
     }
     
-    // 3. Convert decrypted bytes to UTF-8 String
-    guard let plaintext = String(data: decryptedData, encoding: .utf8) else {
-        print("❌ Decryption succeeded, but UTF-8 decoding failed")
-        print("   Raw bytes: \(decryptedData.map { String(format: "%02x", $0) }.joined())")
-        return nil
+    // MARK: - Public Key Export (X.509/SPKI format required by Java)
+    
+    private static func exportPublicKeyAsX509(_ publicKey: SecKey) -> String? {
+        var error: Unmanaged<CFError>?
+        guard let rawKeyData = SecKeyCopyExternalRepresentation(publicKey, &error) as Data? else {
+            print("Export failed: \(error!.takeRetainedValue())")
+            return nil
+        }
+        
+        // Wrap raw PKCS#1 bytes in X.509 SubjectPublicKeyInfo ASN.1 header
+        // This header is fixed for RSA-2048. For RSA-4096, update the length bytes.
+        let x509Header: [UInt8] = [
+            0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00
+        ]
+        
+        var spkiData = Data(x509Header)
+        spkiData.append(rawKeyData)
+        return spkiData.base64EncodedString()
     }
     
-    print("✅ Decryption successful: \(plaintext)")
-    return plaintext
+    // MARK: - Decryption (iOS 10+, covers 12–27)
+    
+    /// Decrypts Base64 ciphertext using stored private key. Returns UTF-8 String.
+    static func decrypt(base64Ciphertext: String) -> String? {
+        guard let privateKey = retrievePrivateKey() else {
+            print("Private key not found in Keychain")
+            return nil
+        }
+        
+        guard let cipherData = Data(base64Encoded: base64Ciphertext) else {
+            print("Invalid Base64 ciphertext")
+            return nil
+        }
+        
+        // Critical: must match backend's SHA-256 OAEP + SHA-256 MGF1
+        let algorithm = SecKeyAlgorithm.rsaEncryptionOAEPSHA256
+        
+        guard SecKeyIsAlgorithmSupported(privateKey, .decrypt, algorithm) else {
+            print("Algorithm not supported by key")
+            return nil
+        }
+        
+        var error: Unmanaged<CFError>?
+        guard let decryptedData = SecKeyCreateDecryptedData(
+            privateKey,
+            algorithm,
+            cipherData as CFData,
+            &error
+        ) as Data? else {
+            let cfError = error!.takeRetainedValue()
+            let nsError = cfError as Error as NSError
+            print("Decryption failed [\(nsError.code)]: \(nsError.localizedDescription)")
+            return nil
+        }
+        
+        return String(data: decryptedData, encoding: .utf8)
+    }
+    
+    // MARK: - Keychain Retrieval
+    
+    private static func retrievePrivateKey() -> SecKey? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: privateKeyTag,
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess else {
+            print("Keychain lookup failed: \(status)")
+            return nil
+        }
+        return (item as! SecKey)
+    }
 }
+
+
