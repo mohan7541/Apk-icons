@@ -165,3 +165,38 @@ class RSAKeyManager {
 }
 
 
+
+
+static func generateKeyPair() -> String? {
+    // ✅ If a key already exists, return its public key instead of creating a new one
+    if let existingPrivateKey = retrievePrivateKey(),
+       let existingPublicKey = SecKeyCopyPublicKey(existingPrivateKey) {
+        print("Reusing existing keypair")
+        return exportPublicKeyAsX509(existingPublicKey)
+    }
+    
+    // No existing key — create a new one
+    let attributes: [String: Any] = [
+        kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+        kSecAttrKeySizeInBits as String: 2048,
+        kSecPrivateKeyAttrs as String: [
+            kSecAttrIsPermanent as String: true,
+            kSecAttrApplicationTag as String: privateKeyTag,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+    ]
+    
+    var error: Unmanaged<CFError>?
+    guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
+        print("Key generation failed: \(error!.takeRetainedValue())")
+        return nil
+    }
+    
+    guard let publicKey = SecKeyCopyPublicKey(privateKey) else { return nil }
+    print("Generated new keypair")
+    return exportPublicKeyAsX509(publicKey)
+}
+
+
+
+
