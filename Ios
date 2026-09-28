@@ -342,3 +342,124 @@ public class RSAKeyManager {
     }
 }
 
+
+New
+
+import android.os.Build;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.util.Base64;
+
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.cert.Certificate;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.MGF1ParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
+
+public class RSAKeyManager {
+
+    private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
+    private static final String KEY_ALIAS = "com.yourapp.rsa.private";
+    private static final int KEY_SIZE = 2048;
+
+    public static String generateKeyPair() {
+        try {
+            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+            keyStore.load(null);
+
+            // ✅ Retrieve public key from CERTIFICATE, not from PrivateKey
+            if (keyStore.containsAlias(KEY_ALIAS)) {
+                Certificate cert = keyStore.getCertificate(KEY_ALIAS);
+                if (cert != null) {
+                    PublicKey existingPublicKey = cert.getPublicKey(); // ✅ Correct type
+                    System.out.println("Reusing existing keypair");
+                    return exportPublicKey(existingPublicKey);
+                }
+            }
+
+            // Generate new keypair
+            KeyPairGenerator kpg = KeyPairGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_RSA, ANDROID_KEYSTORE
+            );
+
+            KeyGenParameterSpec.Builder builder = new KeyGenParameterSpec.Builder(
+                KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT
+            )
+                .setKeySize(KEY_SIZE)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP);
+
+            if (Build.VERSION.SDK_INT >= 35) {
+                builder.setDigests(KeyProperties.DIGEST_SHA256);
+                builder.setMgf1Digests("SHA-256");
+            } else if (Build.VERSION.SDK_INT >= 34) {
+                builder.setDigests(KeyProperties.DIGEST_SHA256);
+            } else {
+                builder.setDigests(KeyProperties.DIGEST_SHA1);
+            }
+
+            kpg.initialize(builder.build());
+            KeyPair keyPair = kpg.generateKeyPair();
+            System.out.println("Generated new keypair");
+
+            return exportPublicKey(keyPair.getPublic()); // ✅ PublicKey type
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private static String exportPublicKey(PublicKey publicKey) {
+        byte[] x509Bytes = publicKey.getEncoded();
+        return Base64.encodeToString(x509Bytes, Base64.NO_WRAP);
+    }
+
+    private static PrivateKey retrievePrivateKey() {
+        try {
+            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+            keyStore.load(null);
+
+            if (!keyStore.containsAlias(KEY_ALIAS)) {
+                System.out.println("Private key not found in Keystore");
+                return null;
+            }
+            return (PrivateKey) keyStore.getKey(KEY_ALIAS, null); // ✅ PrivateKey
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    public static String decrypt(String base64Ciphertext) {
+        try {
+            PrivateKey privateKey = retrievePrivateKey();
+            if (privateKey == null) return null;
+
+            byte[] cipherData = Base64.decode(base64Ciphertext, Base64.DEFAULT);
+            Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+
+            MGF1ParameterSpec mgf1Spec = (Build.VERSION.SDK_INT >= 34)
+                ? MGF1ParameterSpec.SHA256
+                : MGF1ParameterSpec.SHA1;
+
+            OAEPParameterSpec oaepSpec = new OAEPParameterSpec(
+                "SHA-256", "MGF1", mgf1Spec, PSource.PSpecified.DEFAULT
+            );
+
+            cipher.init(Cipher.DECRYPT_MODE, privateKey, oaepSpec);
+            byte[] decryptedBytes = cipher.doFinal(cipherData);
+            return new String(decryptedBytes, "UTF-8");
+
+        } catch (Exception e) {
+            System.out.println("Decryption failed: " + e.getMessage());
+            return null;
+        }
+    }
+}
