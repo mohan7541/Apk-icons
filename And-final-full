@@ -168,6 +168,16 @@ public class RsaCryptoManager {
                 .setMgf1Digests(KeyProperties.DIGEST_SHA256)
                 .build());
         kpg.generateKeyPair();
+
+        // Self-test: some devices generate the key fine but reject MGF1-SHA256 at Cipher.init
+        // (KeyStoreException -79 / UNSUPPORTED_MGF_DIGEST). Throwing here triggers the software fallback.
+        KeyStore ks = KeyStore.getInstance(AKS);
+        ks.load(null);
+        PrivateKey testKey = (PrivateKey) ks.getKey(RSA_ALIAS, null);
+        Cipher test = Cipher.getInstance(TRANSFORMATION);
+        test.init(Cipher.DECRYPT_MODE, testKey, new OAEPParameterSpec(
+                "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+
         publicKeyBase64 = keystorePublicKeyBase64();
     }
 
@@ -267,50 +277,3 @@ public class RsaCryptoManager {
         }
     }
 }
-
-
-import android.content.Context;
-
-/**
- * Single access point. Call get() from a BACKGROUND thread.
- * The RSA key is created only once; later calls reuse it.
- */
-public class KeyProvider {
-
-    private static RsaCryptoManager instance;
-
-    public static synchronized RsaCryptoManager get(Context context) throws Exception {
-        if (instance == null) {
-            instance = new RsaCryptoManager(context.getApplicationContext());
-        }
-        // Re-send the public key until the server has confirmed it
-        if (!instance.isPublicKeyUploaded()) {
-            boolean ok = uploadPublicKey(instance.getPublicKeyBase64());
-            if (ok) instance.markPublicKeyUploaded();
-        }
-        return instance;
-    }
-
-    // TODO: replace with your real API call (return true on HTTP success)
-    private static boolean uploadPublicKey(String publicKeyBase64) {
-        return false;
-    }
-}
-
-
-
-
-new Thread(() -> {
-    try {
-        RsaCryptoManager rsa = KeyProvider.get(getApplicationContext());
-
-        // Get the public key (send to Spring Boot)
-        String publicKey = rsa.getPublicKeyBase64();
-
-        // Decrypt data received from the server
-        String plain = rsa.decrypt(encryptedBase64);
-
-    } catch (Exception e) {
-        Log.e("RSA", "Failed", e);
-    }
-}).start();
