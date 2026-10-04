@@ -1,0 +1,316 @@
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.Build;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.util.Base64;
+import android.util.Log;
+
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.Provider;
+import java.security.PublicKey;
+import java.security.interfaces.RSAPrivateCrtKey;
+import java.security.spec.MGF1ParameterSpec;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.RSAPublicKeySpec;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
+
+/**
+ * RSA-OAEP with SHA-256 + MGF1-SHA256 on Android 7.0+ (API 24+).
+ *
+ *  API 34+   : RSA key in AndroidKeyStore (falls back to software if device rejects MGF1-SHA256)
+ *  API 24-33 : RSA key from BouncyCastle, private key encrypted by a Keystore AES-GCM key
+ *
+ * Gradle: implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+ *
+ * IMPORTANT: construct this on a background thread (key generation is slow).
+ */
+public class RsaCryptoManager {
+
+    private static final String TAG = "RsaCryptoManager";
+    private static final String AKS = "AndroidKeyStore";
+    private static final String RSA_ALIAS = "enc_rsa_key";
+    private static final String WRAP_ALIAS = "enc_wrap_key";
+    private static final String PREFS = "rsa_prefs";
+    private static final String TRANSFORMATION = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
+
+    private static final String MODE_KEYSTORE = "KEYSTORE_V2";
+    private static final String MODE_SOFTWARE = "SOFTWARE_V2";
+    private static final int GCM_IV_LENGTH = 12;
+
+    private static final Provider BC = new BouncyCastleProvider();
+
+    private final SharedPreferences prefs;
+    private boolean useKeystoreRsa = Build.VERSION.SDK_INT >= 34;
+    private boolean newKeyCreated;
+    private String publicKeyBase64;
+    private PrivateKey cachedSoftwareKey;
+
+    public RsaCryptoManager(Context context) throws Exception {
+        this.prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        setupKeys();
+    }
+
+    // ------------------------------------------------------------------ public API
+
+    /** X.509 public key, Base64 (NO_WRAP). Send this to your Spring Boot server. */
+    public String getPublicKeyBase64() {
+        return publicKeyBase64;
+    }
+
+    /** True if a new key pair was created during construction (server needs the new public key). */
+    public boolean isNewKeyCreated() {
+        return newKeyCreated;
+    }
+
+    public boolean isPublicKeyUploaded() {
+        return prefs.getBoolean("pub_uploaded", false);
+    }
+
+    public void markPublicKeyUploaded() {
+        prefs.edit().putBoolean("pub_uploaded", true).apply();
+    }
+
+    /** Decrypts Base64 data produced by the server (OAEP-SHA256 / MGF1-SHA256). */
+    public String decrypt(String encryptedData) throws Exception {
+        String cleaned = encryptedData.trim().replace(" ", "+").replaceAll("\\s", "");
+        byte[] cipherData;
+        try {
+            cipherData = Base64.decode(cleaned, Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            cipherData = Base64.decode(cleaned, Base64.URL_SAFE);
+        }
+
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+                "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT);
+
+        Cipher cipher;
+        PrivateKey privateKey;
+        if (useKeystoreRsa) {
+            KeyStore ks = KeyStore.getInstance(AKS);
+            ks.load(null);
+            privateKey = (PrivateKey) ks.getKey(RSA_ALIAS, null);
+            cipher = Cipher.getInstance(TRANSFORMATION);
+        } else {
+            privateKey = loadSoftwarePrivateKey();
+            cipher = Cipher.getInstance(TRANSFORMATION, BC);
+        }
+        if (privateKey == null) throw new IllegalStateException("Private key not available");
+
+        cipher.init(Cipher.DECRYPT_MODE, privateKey, spec);
+        return new String(cipher.doFinal(cipherData), StandardCharsets.UTF_8);
+    }
+
+    // ------------------------------------------------------------------ setup
+
+    private synchronized void setupKeys() throws Exception {
+        String savedMode = prefs.getString("mode", null);
+        if (MODE_SOFTWARE.equals(savedMode)) useKeystoreRsa = false;
+        String expectedMode = useKeystoreRsa ? MODE_KEYSTORE : MODE_SOFTWARE;
+
+        // Reuse existing key
+        if (expectedMode.equals(savedMode) && keyExists()) {
+            try {
+                publicKeyBase64 = useKeystoreRsa
+                        ? keystorePublicKeyBase64()
+                        : derivePublicKeyBase64(loadSoftwarePrivateKey());
+                newKeyCreated = false;
+                return;
+            } catch (Exception e) {
+                Log.w(TAG, "Could not read existing key, regenerating", e);
+            }
+        }
+
+        // Create a new key
+        clearAll();
+        if (useKeystoreRsa) {
+            try {
+                generateKeystoreRsa();
+            } catch (Exception e) {
+                Log.w(TAG, "Keystore MGF1-SHA256 unsupported, using software key", e);
+                clearAll();
+                useKeystoreRsa = false;
+                generateSoftwareRsa();
+            }
+        } else {
+            generateSoftwareRsa();
+        }
+        prefs.edit()
+                .putString("mode", useKeystoreRsa ? MODE_KEYSTORE : MODE_SOFTWARE)
+                .putBoolean("pub_uploaded", false)
+                .apply();
+        newKeyCreated = true;
+    }
+
+    // ------------------------------------------------------------------ API 34+ : Keystore RSA
+
+    private void generateKeystoreRsa() throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, AKS);
+        kpg.initialize(new KeyGenParameterSpec.Builder(
+                RSA_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setKeySize(2048)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setMgf1Digests(KeyProperties.DIGEST_SHA256)
+                .build());
+        kpg.generateKeyPair();
+        publicKeyBase64 = keystorePublicKeyBase64();
+    }
+
+    private String keystorePublicKeyBase64() throws Exception {
+        KeyStore ks = KeyStore.getInstance(AKS);
+        ks.load(null);
+        byte[] pub = ks.getCertificate(RSA_ALIAS).getPublicKey().getEncoded();
+        return Base64.encodeToString(pub, Base64.NO_WRAP);
+    }
+
+    // ------------------------------------------------------------------ API 24-33 : software RSA
+
+    private void generateSoftwareRsa() throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA", BC);
+        kpg.initialize(2048);
+        KeyPair kp = kpg.generateKeyPair();
+
+        Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+        aes.init(Cipher.ENCRYPT_MODE, getOrCreateWrapKey());
+        byte[] iv = aes.getIV();
+        byte[] enc = aes.doFinal(kp.getPrivate().getEncoded());
+
+        byte[] blob = new byte[iv.length + enc.length]; // IV + ciphertext
+        System.arraycopy(iv, 0, blob, 0, iv.length);
+        System.arraycopy(enc, 0, blob, iv.length, enc.length);
+
+        prefs.edit().putString("priv", Base64.encodeToString(blob, Base64.NO_WRAP)).apply();
+        cachedSoftwareKey = kp.getPrivate();
+        publicKeyBase64 = derivePublicKeyBase64(kp.getPrivate());
+    }
+
+    private synchronized PrivateKey loadSoftwarePrivateKey() throws Exception {
+        if (cachedSoftwareKey != null) return cachedSoftwareKey;
+
+        byte[] blob = Base64.decode(prefs.getString("priv", ""), Base64.NO_WRAP);
+        Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+        aes.init(Cipher.DECRYPT_MODE, getOrCreateWrapKey(),
+                new GCMParameterSpec(128, blob, 0, GCM_IV_LENGTH));
+        byte[] privBytes = aes.doFinal(blob, GCM_IV_LENGTH, blob.length - GCM_IV_LENGTH);
+
+        cachedSoftwareKey = KeyFactory.getInstance("RSA", BC)
+                .generatePrivate(new PKCS8EncodedKeySpec(privBytes));
+        return cachedSoftwareKey;
+    }
+
+    private String derivePublicKeyBase64(PrivateKey priv) throws Exception {
+        RSAPrivateCrtKey crt = (RSAPrivateCrtKey) priv;
+        PublicKey pub = KeyFactory.getInstance("RSA", BC)
+                .generatePublic(new RSAPublicKeySpec(crt.getModulus(), crt.getPublicExponent()));
+        return Base64.encodeToString(pub.getEncoded(), Base64.NO_WRAP);
+    }
+
+    private SecretKey getOrCreateWrapKey() throws Exception {
+        KeyStore ks = KeyStore.getInstance(AKS);
+        ks.load(null);
+        if (ks.containsAlias(WRAP_ALIAS)) {
+            return ((KeyStore.SecretKeyEntry) ks.getEntry(WRAP_ALIAS, null)).getSecretKey();
+        }
+        KeyGenerator kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, AKS);
+        kg.init(new KeyGenParameterSpec.Builder(
+                WRAP_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .build());
+        return kg.generateKey();
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private boolean keyExists() {
+        try {
+            if (useKeystoreRsa) {
+                KeyStore ks = KeyStore.getInstance(AKS);
+                ks.load(null);
+                return ks.containsAlias(RSA_ALIAS);
+            }
+            if (!prefs.contains("priv")) return false;
+            loadSoftwarePrivateKey(); // verifies the wrapped key is still decryptable
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "Existing key unusable", e);
+            return false;
+        }
+    }
+
+    private void clearAll() {
+        cachedSoftwareKey = null;
+        prefs.edit().clear().apply();
+        try {
+            KeyStore ks = KeyStore.getInstance(AKS);
+            ks.load(null);
+            if (ks.containsAlias(RSA_ALIAS)) ks.deleteEntry(RSA_ALIAS);
+            if (ks.containsAlias(WRAP_ALIAS)) ks.deleteEntry(WRAP_ALIAS);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed clearing keystore", e);
+        }
+    }
+}
+
+
+import android.content.Context;
+
+/**
+ * Single access point. Call get() from a BACKGROUND thread.
+ * The RSA key is created only once; later calls reuse it.
+ */
+public class KeyProvider {
+
+    private static RsaCryptoManager instance;
+
+    public static synchronized RsaCryptoManager get(Context context) throws Exception {
+        if (instance == null) {
+            instance = new RsaCryptoManager(context.getApplicationContext());
+        }
+        // Re-send the public key until the server has confirmed it
+        if (!instance.isPublicKeyUploaded()) {
+            boolean ok = uploadPublicKey(instance.getPublicKeyBase64());
+            if (ok) instance.markPublicKeyUploaded();
+        }
+        return instance;
+    }
+
+    // TODO: replace with your real API call (return true on HTTP success)
+    private static boolean uploadPublicKey(String publicKeyBase64) {
+        return false;
+    }
+}
+
+
+
+
+new Thread(() -> {
+    try {
+        RsaCryptoManager rsa = KeyProvider.get(getApplicationContext());
+
+        // Get the public key (send to Spring Boot)
+        String publicKey = rsa.getPublicKeyBase64();
+
+        // Decrypt data received from the server
+        String plain = rsa.decrypt(encryptedBase64);
+
+    } catch (Exception e) {
+        Log.e("RSA", "Failed", e);
+    }
+}).start();
